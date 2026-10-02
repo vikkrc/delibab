@@ -1,0 +1,151 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS (universal)
+            os: macos-14
+            cmake_args: '"-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"'
+            artifact: Delibab-macOS
+          - name: Windows (x64)
+            os: windows-latest
+            cmake_args: -A x64
+            artifact: Delibab-Windows
+          - name: Linux (tests)
+            os: ubuntu-24.04
+            cmake_args: -G Ninja
+            artifact: Delibab-Linux
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build xvfb \
+            libasound2-dev libfreetype-dev libfontconfig1-dev libx11-dev libxrandr-dev \
+            libxinerama-dev libxcursor-dev libxext-dev libxi-dev libgl1-mesa-dev
+
+      - name: Configure
+        shell: bash
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_args }}
+
+      - name: Build
+        shell: bash
+        run: cmake --build build --config Release --parallel 4
+
+      - name: Run tests
+        shell: bash
+        run: |
+          cd build
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            xvfb-run -a ./DelibabTests_artefacts/Release/DelibabTests test-output
+          elif [ "$RUNNER_OS" == "Windows" ]; then
+            ./DelibabTests_artefacts/Release/DelibabTests.exe test-output
+          else
+            ./DelibabTests_artefacts/Release/DelibabTests test-output
+          fi
+
+      - name: Ad-hoc code sign (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cd build/Delibab_artefacts/Release
+          for b in VST3/Delibab.vst3 AU/Delibab.component CLAP/Delibab.clap Standalone/Delibab.app; do
+            codesign --force --deep --sign - "$b"
+          done
+
+      - name: Validate AU with auval (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p ~/Library/Audio/Plug-Ins/Components
+          cp -R build/Delibab_artefacts/Release/AU/Delibab.component ~/Library/Audio/Plug-Ins/Components/
+          killall -9 AudioComponentRegistrar || true
+          sleep 2
+          auval -v aumu Dlbb Vkrc
+
+      - name: Validate VST3 with pluginval
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            curl -sSL -o pv.zip https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_Linux.zip
+            unzip -q pv.zip
+            xvfb-run -a ./pluginval --strictness-level 8 --validate-in-process --timeout-ms 600000 build/Delibab_artefacts/Release/VST3/Delibab.vst3
+          elif [ "$RUNNER_OS" == "Windows" ]; then
+            curl -sSL -o pv.zip https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_Windows.zip
+            7z x -y pv.zip > /dev/null
+            ./pluginval.exe --strictness-level 8 --validate-in-process --timeout-ms 600000 build/Delibab_artefacts/Release/VST3/Delibab.vst3
+          else
+            curl -sSL -o pv.zip https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_macOS.zip
+            unzip -q pv.zip
+            ./pluginval.app/Contents/MacOS/pluginval --strictness-level 8 --validate-in-process --timeout-ms 600000 build/Delibab_artefacts/Release/VST3/Delibab.vst3
+          fi
+
+      - name: Package
+        shell: bash
+        run: |
+          # Zip here (not in upload-artifact) so macOS bundles keep their
+          # executable bits and symlinks.
+          mkdir -p dist/Delibab
+          R=build/Delibab_artefacts/Release
+          cp INSTALL.md dist/Delibab/
+          if [ "$RUNNER_OS" == "macOS" ]; then
+            for b in VST3/Delibab.vst3 AU/Delibab.component CLAP/Delibab.clap Standalone/Delibab.app; do
+              ditto "$R/$b" "dist/Delibab/$(basename "$b")"
+            done
+            (cd dist && ditto -c -k --sequesterRsrc --keepParent Delibab ${{ matrix.artifact }}.zip)
+          elif [ "$RUNNER_OS" == "Windows" ]; then
+            cp -R "$R/VST3/Delibab.vst3" "$R/CLAP/Delibab.clap" "$R/Standalone/Delibab.exe" dist/Delibab/
+            (cd dist && 7z a -tzip ${{ matrix.artifact }}.zip Delibab > /dev/null)
+          else
+            cp -R "$R/VST3/Delibab.vst3" "$R/CLAP/Delibab.clap" "$R/Standalone/Delibab" dist/Delibab/
+            (cd dist && zip -qry ${{ matrix.artifact }}.zip Delibab)
+          fi
+
+      - name: Upload plugins
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}.zip
+
+      - name: Upload test renders
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Test-renders
+          path: build/test-output
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/Delibab-macOS.zip
+            artifacts/Delibab-Windows.zip
